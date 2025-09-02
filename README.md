@@ -77,9 +77,22 @@ Một ứng dụng **chat bảo mật** (End-to-End Encrypted) được xây d�
 ---
 
 ## 📸 Demo (đang cập nhật)
-_(thêm ảnh/gif UI sau khi hoàn thiện)_
+coming soon...
 
 ---
 
 ## 👨‍💻 Tác giả
 Dự án cá nhân bởi **Hansuke** – phục vụ portfolio & rèn luyện kỹ năng fullstack.
+
+---
+
+## 💵 Donate tui qua
+- Momo + Zalopay: 0946039187
+- Vietcombank: 
+- MB Bank: 230804121105
+- Paypal: Updating...
+Mọi sự ủng hộ của các bạn sẽ là động lực để tôi có thể phát triển app có thêm nhiều tính năng hay hơn
+
+---
+
+## Nếu thấy repo hay đừng ngần ngại cho tớ 1 star nhé. Tớ cảm ơn rấc nhìuuuuuu <3
