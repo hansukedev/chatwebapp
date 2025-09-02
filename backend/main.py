@@ -1,5 +1,5 @@
 import json
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Query
@@ -8,7 +8,7 @@ from sqlmodel import Session, select
 from sqlalchemy import or_
 
 from database import engine, create_db_and_tables
-from models import User, Message
+from models import User, Message, Room, RoomMember
 from security import get_password_hash, verify_password, create_access_token, SECRET_KEY, ALGORITHM
 from jose import JWTError, jwt
 from fastapi.security import OAuth2PasswordBearer
@@ -28,14 +28,35 @@ class TokenData(BaseModel):
     username: str | None = None
 
 class UserInfo(BaseModel):
+    id: int
     username: str
+    is_online: bool
+    
+    class Config:
+        from_attributes = True
+
+class RoomCreate(BaseModel):
+    name: str
+
+class RoomInfo(BaseModel):
+    id: int
+    name: str
+    created_by: int
+    created_at: datetime
+    member_count: int
+    
+    class Config:
+        from_attributes = True
 
 class MessageInfo(BaseModel):
     id: int
     sender_id: int
-    receiver_id: int
+    receiver_id: Optional[int] = None
+    room_id: Optional[int] = None
     sender_username: str
-    receiver_username: str
+    receiver_username: Optional[str] = None
+    room_name: Optional[str] = None
+    message_type: str
     ciphertext: str
     iv: str
     timestamp: datetime
@@ -118,6 +139,101 @@ async def get_users(current_user: User = Depends(get_current_user), session: Ses
     users = session.exec(select(User).where(User.username != current_user.username)).all()
     return users
 
+@app.get("/rooms", response_model=List[RoomInfo])
+async def get_rooms(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Get all rooms that the current user is a member of"""
+    rooms = session.exec(
+        select(Room)
+        .join(RoomMember, Room.id == RoomMember.room_id)
+        .where(RoomMember.user_id == current_user.id, RoomMember.is_active == True, Room.is_active == True)
+    ).all()
+    
+    # Add member count to each room
+    result = []
+    for room in rooms:
+        member_count = session.exec(
+            select(RoomMember).where(RoomMember.room_id == room.id, RoomMember.is_active == True)
+        ).count()
+        result.append(RoomInfo(
+            id=room.id,
+            name=room.name,
+            created_by=room.created_by,
+            created_at=room.created_at,
+            member_count=member_count
+        ))
+    
+    return result
+
+@app.post("/rooms", response_model=RoomInfo)
+async def create_room(room: RoomCreate, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Create a new room"""
+    # Check if room name already exists
+    existing_room = session.exec(select(Room).where(Room.name == room.name)).first()
+    if existing_room:
+        raise HTTPException(status_code=400, detail="Room name already exists")
+    
+    # Create room
+    new_room = Room(name=room.name, created_by=current_user.id)
+    session.add(new_room)
+    session.commit()
+    session.refresh(new_room)
+    
+    # Add creator as member
+    member = RoomMember(room_id=new_room.id, user_id=current_user.id)
+    session.add(member)
+    session.commit()
+    
+    return RoomInfo(
+        id=new_room.id,
+        name=new_room.name,
+        created_by=new_room.created_by,
+        created_at=new_room.created_at,
+        member_count=1
+    )
+
+@app.post("/rooms/{room_id}/join")
+async def join_room(room_id: int, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Join a room"""
+    # Check if room exists
+    room = session.exec(select(Room).where(Room.id == room_id, Room.is_active == True)).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    # Check if already a member
+    existing_member = session.exec(
+        select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == current_user.id)
+    ).first()
+    
+    if existing_member:
+        if existing_member.is_active:
+            raise HTTPException(status_code=400, detail="Already a member of this room")
+        else:
+            # Reactivate membership
+            existing_member.is_active = True
+            session.commit()
+    else:
+        # Add new member
+        member = RoomMember(room_id=room_id, user_id=current_user.id)
+        session.add(member)
+        session.commit()
+    
+    return {"message": "Successfully joined room"}
+
+@app.post("/rooms/{room_id}/leave")
+async def leave_room(room_id: int, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Leave a room"""
+    member = session.exec(
+        select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == current_user.id)
+    ).first()
+    
+    if not member:
+        raise HTTPException(status_code=404, detail="Not a member of this room")
+    
+    member.is_active = False
+    session.commit()
+    
+    return {"message": "Successfully left room"}
+
 @app.get("/messages/{other_user}", response_model=List[MessageInfo])
 async def get_message_history(other_user: str, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     # Get the other user
@@ -135,18 +251,59 @@ async def get_message_history(other_user: str, current_user: User = Depends(get_
     ).all()
     return messages
 
+@app.get("/rooms/{room_id}/messages", response_model=List[MessageInfo])
+async def get_room_messages(room_id: int, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Get message history for a room"""
+    # Check if user is member of room
+    member = session.exec(
+        select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == current_user.id, RoomMember.is_active == True)
+    ).first()
+    
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    
+    messages = session.exec(
+        select(Message).where(Message.room_id == room_id).order_by(Message.timestamp)
+    ).all()
+    
+    return messages
+
 # --- WebSocket Logic ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        self.user_typing: Dict[str, Dict[str, bool]] = {}  # room_id -> {username: is_typing}
+        self.user_rooms: Dict[str, List[str]] = {}  # username -> [room_ids]
 
     async def connect(self, websocket: WebSocket, username: str):
         await websocket.accept()
         self.active_connections[username] = websocket
+        self.user_rooms[username] = []
+        
+        # Update user online status
+        with Session(engine) as session:
+            user = session.exec(select(User).where(User.username == username)).first()
+            if user:
+                user.is_online = True
+                session.commit()
 
     def disconnect(self, username: str):
         if username in self.active_connections:
             del self.active_connections[username]
+            
+        # Update user offline status
+        with Session(engine) as session:
+            user = session.exec(select(User).where(User.username == username)).first()
+            if user:
+                user.is_online = False
+                session.commit()
+        
+        # Remove from typing indicators
+        if username in self.user_rooms:
+            for room_id in self.user_rooms[username]:
+                if room_id in self.user_typing and username in self.user_typing[room_id]:
+                    del self.user_typing[room_id][username]
+            del self.user_rooms[username]
 
     async def broadcast(self, message: str):
         for connection in self.active_connections.values():
@@ -155,9 +312,160 @@ class ConnectionManager:
     async def send_private_message(self, message: str, username: str):
         if username in self.active_connections:
             await self.active_connections[username].send_text(message)
+    
+    async def send_room_message(self, message: str, room_id: str):
+        """Send message to all users in a room"""
+        with Session(engine) as session:
+            members = session.exec(
+                select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.is_active == True)
+            ).all()
+            
+            for member in members:
+                username = session.exec(select(User).where(User.id == member.user_id)).first().username
+                if username in self.active_connections:
+                    await self.active_connections[username].send_text(message)
+    
+    def set_user_typing(self, username: str, room_id: str, is_typing: bool):
+        """Set typing indicator for user in room"""
+        if room_id not in self.user_typing:
+            self.user_typing[room_id] = {}
+        
+        if is_typing:
+            self.user_typing[room_id][username] = True
+        else:
+            if username in self.user_typing[room_id]:
+                del self.user_typing[room_id][username]
+    
+    def get_typing_users(self, room_id: str) -> List[str]:
+        """Get list of users currently typing in room"""
+        return list(self.user_typing.get(room_id, {}).keys())
+    
+    def add_user_to_room(self, username: str, room_id: str):
+        """Add user to room tracking"""
+        if username not in self.user_rooms:
+            self.user_rooms[username] = []
+        if room_id not in self.user_rooms[username]:
+            self.user_rooms[username].append(room_id)
 
     def get_online_users(self) -> List[str]:
         return list(self.active_connections.keys())
+
+# Helper functions for WebSocket message handling
+async def handle_private_message(sender_username: str, receiver_username: str, payload: dict, session: Session):
+    """Handle private message processing"""
+    try:
+        # Get sender and receiver user IDs
+        sender_user = session.exec(select(User).where(User.username == sender_username)).first()
+        receiver_user = session.exec(select(User).where(User.username == receiver_username)).first()
+        
+        if not sender_user or not receiver_user:
+            print(f"User not found: sender={sender_username}, receiver={receiver_username}")
+            return
+        
+        # Save to DB
+        db_message = Message(
+            sender_id=sender_user.id,
+            receiver_id=receiver_user.id,
+            sender_username=sender_username,
+            receiver_username=receiver_username,
+            message_type="private",
+            ciphertext=payload['ciphertext'],
+            iv=payload['iv']
+        )
+        session.add(db_message)
+        session.commit()
+        session.refresh(db_message)
+
+        # Create relay message
+        relay_message = {
+            "type": "private_message",
+            "data": {
+                "id": db_message.id,
+                "sender_id": db_message.sender_id,
+                "receiver_id": db_message.receiver_id,
+                "sender_username": db_message.sender_username,
+                "receiver_username": db_message.receiver_username,
+                "message_type": db_message.message_type,
+                "ciphertext": db_message.ciphertext,
+                "iv": db_message.iv,
+                "timestamp": db_message.timestamp.isoformat() if db_message.timestamp else None
+            }
+        }
+        
+        # Send message to receiver and sender
+        await manager.send_private_message(json.dumps(relay_message), receiver_username)
+        await manager.send_private_message(json.dumps(relay_message), sender_username)
+        print(f"Private message relayed successfully from {sender_username} to {receiver_username}")
+        
+    except Exception as e:
+        print(f"Error handling private message: {e}")
+
+async def handle_group_message(sender_username: str, room_id: int, payload: dict, session: Session):
+    """Handle group message processing"""
+    try:
+        # Get sender user ID
+        sender_user = session.exec(select(User).where(User.username == sender_username)).first()
+        if not sender_user:
+            print(f"User not found: {sender_username}")
+            return
+        
+        # Get room info
+        room = session.exec(select(Room).where(Room.id == room_id)).first()
+        if not room:
+            print(f"Room not found: {room_id}")
+            return
+        
+        # Save to DB
+        db_message = Message(
+            sender_id=sender_user.id,
+            room_id=room_id,
+            sender_username=sender_username,
+            room_name=room.name,
+            message_type="group",
+            ciphertext=payload['ciphertext'],
+            iv=payload['iv']
+        )
+        session.add(db_message)
+        session.commit()
+        session.refresh(db_message)
+
+        # Create relay message
+        relay_message = {
+            "type": "group_message",
+            "data": {
+                "id": db_message.id,
+                "sender_id": db_message.sender_id,
+                "room_id": db_message.room_id,
+                "sender_username": db_message.sender_username,
+                "room_name": db_message.room_name,
+                "message_type": db_message.message_type,
+                "ciphertext": db_message.ciphertext,
+                "iv": db_message.iv,
+                "timestamp": db_message.timestamp.isoformat() if db_message.timestamp else None
+            }
+        }
+        
+        # Send message to all room members
+        await manager.send_room_message(json.dumps(relay_message), str(room_id))
+        print(f"Group message relayed successfully in room {room.name}")
+        
+    except Exception as e:
+        print(f"Error handling group message: {e}")
+
+async def broadcast_typing_indicator(room_id: int, typing_users: List[str]):
+    """Broadcast typing indicator to room members"""
+    if not typing_users:
+        return
+    
+    typing_message = {
+        "type": "typing_indicator",
+        "data": {
+            "room_id": room_id,
+            "typing_users": typing_users
+        }
+    }
+    
+    await manager.send_room_message(json.dumps(typing_message), str(room_id))
 
 manager = ConnectionManager()
 
@@ -196,58 +504,39 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
             while True:
                 data = await websocket.receive_text()
                 message_data = json.loads(data)
-                receiver = message_data.get("receiver")
-                payload = message_data.get("payload")
-
-                if receiver and payload:
-                    # Create new session for each message to avoid session issues
-                    with Session(engine) as msg_session:
-                        try:
-                            # Get sender and receiver user IDs
-                            sender_user = msg_session.exec(select(User).where(User.username == username)).first()
-                            receiver_user = msg_session.exec(select(User).where(User.username == receiver)).first()
-                            
-                            if not sender_user or not receiver_user:
-                                print(f"User not found: sender={username}, receiver={receiver}")
-                                continue
-                            
-                            # 1. Save to DB
-                            db_message = Message(
-                                sender_id=sender_user.id,
-                                receiver_id=receiver_user.id,
-                                sender_username=username,
-                                receiver_username=receiver,
-                                ciphertext=payload['ciphertext'],
-                                iv=payload['iv']
-                            )
-                            msg_session.add(db_message)
-                            msg_session.commit()
-                            msg_session.refresh(db_message)
-
-                            # 2. Create relay message manually to avoid Pydantic issues
-                            relay_message = {
-                                "type": "private_message",
-                                "data": {
-                                    "id": db_message.id,
-                                    "sender_id": db_message.sender_id,
-                                    "receiver_id": db_message.receiver_id,
-                                    "sender_username": db_message.sender_username,
-                                    "receiver_username": db_message.receiver_username,
-                                    "ciphertext": db_message.ciphertext,
-                                    "iv": db_message.iv,
-                                    "timestamp": db_message.timestamp.isoformat() if db_message.timestamp else None
-                                }
-                            }
-                            
-                            # 3. Send message to receiver and sender
-                            await manager.send_private_message(json.dumps(relay_message), receiver)
-                            await manager.send_private_message(json.dumps(relay_message), username)
-                            print(f"Message relayed successfully for user: {username}")
-                            
-                        except Exception as msg_error:
-                            print(f"Error processing message: {msg_error}")
-                            # Don't close connection, just log the error
-                            continue
+                message_type = message_data.get("type", "private")
+                
+                if message_type == "private":
+                    # Handle private message
+                    receiver = message_data.get("receiver")
+                    payload = message_data.get("payload")
+                    
+                    if receiver and payload:
+                        with Session(engine) as msg_session:
+                            await handle_private_message(username, receiver, payload, msg_session)
+                        
+                elif message_type == "group":
+                    # Handle group message
+                    room_id = message_data.get("room_id")
+                    payload = message_data.get("payload")
+                    
+                    if room_id and payload:
+                        with Session(engine) as msg_session:
+                            await handle_group_message(username, room_id, payload, msg_session)
+                        
+                elif message_type == "typing_start":
+                    # Handle typing indicator start
+                    room_id = message_data.get("room_id")
+                    if room_id:
+                        manager.set_user_typing(username, str(room_id), True)
+                        await broadcast_typing_indicator(room_id, manager.get_typing_users(str(room_id)))
+                        
+                elif message_type == "typing_stop":
+                    # Handle typing indicator stop
+                    room_id = message_data.get("room_id")
+                    if room_id:
+                        manager.set_user_typing(username, str(room_id), False)
+                        await broadcast_typing_indicator(room_id, manager.get_typing_users(str(room_id)))
                             
         except WebSocketDisconnect:
             print(f"WebSocket disconnected for user: {username}")

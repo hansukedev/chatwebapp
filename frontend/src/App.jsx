@@ -5,6 +5,7 @@ import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
 import ChatLayout from './pages/ChatLayout';
 import ChatPage from './pages/ChatPage';
+import RoomPage from './pages/RoomPage';
 import WelcomePage from './pages/WelcomePage';
 import ProtectedRoute from './components/ProtectedRoute';
 
@@ -25,6 +26,7 @@ function App() {
                     >
                         <Route index element={<WelcomePage />} />
                         <Route path="chat/:otherUsername" element={<ChatPage />} />
+                        <Route path="room/:roomId" element={<RoomPage />} />
                     </Route>
                 </Routes>
             </AuthProvider>

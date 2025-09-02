@@ -4,14 +4,15 @@ import { useAuth } from '../context/AuthContext';
 import { getDeterministicSessionKey, encryptMessage } from '../utils/crypto';
 import ChatMessage from '../components/ChatMessage';
 
-export default function ChatPage() {
+export default function RoomPage() {
     const [messages, setMessages] = useState([]);
     const [messageInput, setMessageInput] = useState('');
     const [sessionKey, setSessionKey] = useState(null);
     const [isWsConnected, setIsWsConnected] = useState(false);
+    const [roomInfo, setRoomInfo] = useState(null);
     const [typingUsers, setTypingUsers] = useState([]);
     const [isTyping, setIsTyping] = useState(false);
-    const { otherUsername } = useParams();
+    const { roomId } = useParams();
     const { user, token } = useAuth();
     const ws = useRef(null);
     const messagesEndRef = useRef(null);
@@ -19,37 +20,36 @@ export default function ChatPage() {
 
     useEffect(() => {
         const setupAndConnect = async () => {
-            if (!user?.sub || !otherUsername || !token) return;
+            if (!user?.sub || !roomId || !token) return;
 
-            // 1. Fetch data and generate key
+            // 1. Fetch room info and generate key
             setMessages([]);
-            const key = await getDeterministicSessionKey(user.sub, otherUsername);
+            const key = await getDeterministicSessionKey(`room_${roomId}`, user.sub);
             setSessionKey(key);
-            const response = await fetch(`http://localhost:8000/messages/${otherUsername}`, {
+            
+            // Fetch room info
+            const roomResponse = await fetch(`http://localhost:8000/rooms/${roomId}/messages`, {
                 headers: { 'Authorization': `Bearer ${token}` },
             });
-            const history = await response.json();
-            setMessages(history);
+            if (roomResponse.ok) {
+                const history = await roomResponse.json();
+                setMessages(history);
+            }
 
-            // 2. Establish new WebSocket connection
+            // 2. Establish WebSocket connection
             ws.current = new WebSocket(`ws://localhost:8000/ws?token=${token}`);
 
             ws.current.onopen = () => {
-                console.log(`WebSocket connection established for chat with ${otherUsername}`);
+                console.log(`WebSocket connection established for room ${roomId}`);
                 setIsWsConnected(true);
             };
 
             ws.current.onmessage = (event) => {
                 const response = JSON.parse(event.data);
-                if (response.type === 'private_message') {
-                    const msg = response.data;
-                    if (msg.sender_username === otherUsername || (msg.sender_username === user.sub && msg.receiver_username === otherUsername)) {
-                        setMessages(prev => [...prev, msg]);
-                    }
-                } else if (response.type === 'typing_indicator') {
-                    // Handle typing indicator for private chat
-                    const typingUsers = response.data.typing_users.filter(u => u !== user.sub);
-                    setTypingUsers(typingUsers);
+                if (response.type === 'group_message' && response.data.room_id === parseInt(roomId)) {
+                    setMessages(prev => [...prev, response.data]);
+                } else if (response.type === 'typing_indicator' && response.data.room_id === parseInt(roomId)) {
+                    setTypingUsers(response.data.typing_users.filter(u => u !== user.sub));
                 }
             };
 
@@ -66,13 +66,15 @@ export default function ChatPage() {
 
         setupAndConnect();
 
-        // The cleanup function will run when dependencies change or component unmounts
         return () => {
             if (ws.current) {
-                ws.current.close(1000, "Component unmounting or dependency changed");
+                ws.current.close(1000, "Component unmounting");
+            }
+            if (typingTimeoutRef.current) {
+                clearTimeout(typingTimeoutRef.current);
             }
         };
-    }, [otherUsername, user?.sub, token]);
+    }, [roomId, user?.sub, token]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -83,7 +85,7 @@ export default function ChatPage() {
             setIsTyping(true);
             ws.current?.send(JSON.stringify({
                 type: 'typing_start',
-                receiver: otherUsername
+                room_id: roomId
             }));
         }
 
@@ -97,21 +99,21 @@ export default function ChatPage() {
             setIsTyping(false);
             ws.current?.send(JSON.stringify({
                 type: 'typing_stop',
-                receiver: otherUsername
+                room_id: roomId
             }));
         }, 2000);
     };
 
     const handleSendMessage = async (e) => {
         e.preventDefault();
-        if (!messageInput.trim()) return; // Prevent empty messages
+        if (!messageInput.trim()) return;
         
         if (ws.current && ws.current.readyState === WebSocket.OPEN && sessionKey) {
             try {
                 const { ciphertext, iv } = await encryptMessage(messageInput, sessionKey);
                 const messageToSend = { 
-                    type: 'private',
-                    receiver: otherUsername, 
+                    type: 'group',
+                    room_id: parseInt(roomId),
                     payload: { ciphertext, iv } 
                 };
                 ws.current.send(JSON.stringify(messageToSend));
@@ -121,13 +123,11 @@ export default function ChatPage() {
                 setIsTyping(false);
                 ws.current.send(JSON.stringify({
                     type: 'typing_stop',
-                    receiver: otherUsername
+                    room_id: roomId
                 }));
             } catch (error) {
                 console.error("Encryption error:", error);
             }
-        } else {
-            console.log("Cannot send message. WebSocket not connected or session key not available.");
         }
     };
 
@@ -142,32 +142,32 @@ export default function ChatPage() {
 
     return (
         <div className="flex flex-col flex-1">
-            {/* Header with avatar and status */}
+            {/* Header */}
             <div className="p-4 bg-white border-b border-gray-200 shadow-sm">
                 <div className="flex items-center space-x-3">
-                    <div className="w-10 h-10 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center text-white font-bold text-lg">
-                        {otherUsername.charAt(0).toUpperCase()}
+                    <div className="w-10 h-10 bg-gradient-to-r from-purple-500 to-pink-600 rounded-full flex items-center justify-center text-white font-bold text-lg">
+                        🏠
                     </div>
                     <div className="flex-1">
-                        <h2 className="text-xl font-bold text-gray-800">{otherUsername}</h2>
-                        <p className="text-sm text-gray-600">🔒 Private encrypted chat</p>
+                        <h2 className="text-xl font-bold text-gray-800">Group Chat</h2>
+                        <p className="text-sm text-gray-600">🔒 Encrypted group conversation</p>
                     </div>
                     <div className={`px-3 py-1 rounded-full text-xs font-semibold ${
                         isWsConnected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
                     }`}>
-                        {isWsConnected ? '🟢 Online' : '🔴 Offline'}
+                        {isWsConnected ? '🟢 Connected' : '🔴 Disconnected'}
                     </div>
                 </div>
             </div>
             
             {/* Messages area */}
-            <div className="flex-1 p-4 overflow-y-auto bg-gradient-to-br from-blue-50 to-indigo-50">
+            <div className="flex-1 p-4 overflow-y-auto bg-gradient-to-br from-purple-50 to-pink-50">
                 {messages.length === 0 ? (
                     <div className="flex items-center justify-center h-full">
                         <div className="text-center text-gray-500">
-                            <div className="text-6xl mb-4">💬</div>
+                            <div className="text-6xl mb-4">🏠</div>
                             <p className="text-lg font-medium">No messages yet</p>
-                            <p className="text-sm">Start a conversation with {otherUsername}</p>
+                            <p className="text-sm">Start the conversation in this group</p>
                         </div>
                     </div>
                 ) : (
@@ -181,6 +181,7 @@ export default function ChatPage() {
                                 msg={msg} 
                                 sessionKey={sessionKey} 
                                 currentUserUsername={user.sub}
+                                isGroupChat={true}
                             />
                         </div>
                     ))
@@ -195,7 +196,10 @@ export default function ChatPage() {
                             <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
                         </div>
                         <span className="text-sm">
-                            {otherUsername} is typing...
+                            {typingUsers.length === 1 
+                                ? `${typingUsers[0]} is typing...`
+                                : `${typingUsers.join(', ')} are typing...`
+                            }
                         </span>
                     </div>
                 )}
@@ -211,8 +215,8 @@ export default function ChatPage() {
                             value={messageInput}
                             onChange={(e) => setMessageInput(e.target.value)}
                             onKeyDown={handleKeyDown}
-                            placeholder={`Message ${otherUsername}... (Enter to send, Shift+Enter for new line)`}
-                            className="w-full px-4 py-3 bg-gray-100 border border-transparent rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all duration-200 pr-12 resize-none"
+                            placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
+                            className="w-full px-4 py-3 bg-gray-100 border border-transparent rounded-full focus:outline-none focus:ring-2 focus:ring-purple-500 focus:bg-white transition-all duration-200 pr-12 resize-none"
                             rows="1"
                             maxLength={500}
                         />
@@ -224,7 +228,7 @@ export default function ChatPage() {
                         type="submit" 
                         className={`px-6 py-3 font-semibold text-white rounded-full transition-all duration-200 ${
                             messageInput.trim() && sessionKey && isWsConnected
-                                ? 'bg-blue-500 hover:bg-blue-600 shadow-md hover:shadow-lg transform hover:scale-105'
+                                ? 'bg-purple-500 hover:bg-purple-600 shadow-md hover:shadow-lg transform hover:scale-105'
                                 : 'bg-gray-400 cursor-not-allowed'
                         }`}
                         disabled={!messageInput.trim() || !sessionKey || !isWsConnected}

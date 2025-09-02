@@ -2,7 +2,7 @@
 import { useState, useEffect } from 'react';
 import { decryptMessage } from '../utils/crypto';
 
-export default function ChatMessage({ msg, sessionKey, currentUserUsername }) {
+export default function ChatMessage({ msg, sessionKey, currentUserUsername, isGroupChat = false }) {
     const [plaintext, setPlaintext] = useState('...');
 
     useEffect(() => {
@@ -45,6 +45,13 @@ export default function ChatMessage({ msg, sessionKey, currentUserUsername }) {
             
             {/* Message content */}
             <div className={`flex flex-col ${isMyMessage ? 'items-end' : 'items-start'} max-w-xs lg:max-w-md xl:max-w-lg`}>
+                {/* Show sender name in group chat */}
+                {isGroupChat && !isMyMessage && (
+                    <span className="text-xs font-medium text-gray-600 mb-1 ml-2">
+                        {msg.sender_username}
+                    </span>
+                )}
+                
                 <div className={`py-3 px-4 rounded-2xl shadow-sm transition-all duration-200 hover:shadow-md ${
                     isMyMessage 
                         ? 'bg-blue-500 text-white rounded-br-md' 
